@@ -99,7 +99,7 @@ st.sidebar.markdown("## ⚙️ Settings")
 st.sidebar.markdown("### Scanner")
 scan_mode = st.sidebar.radio(
     "Scan Mode",
-    options=["playwright", "requests"],
+    options=["requests", "playwright"],
     format_func=lambda x: "Playwright (Full Browser)" if x == "playwright" else "Requests (Static HTML)",
     help="Playwright launches a headless browser to intercept network calls like Chrome Dev Tools. "
          "Requests is faster but only sees static HTML.",
