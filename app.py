@@ -40,54 +40,6 @@ st.set_page_config(
 
 
 # ---------------------------------------------------------------------------
-# Password protection
-# ---------------------------------------------------------------------------
-
-def check_password():
-    """Simple password gate. Set the password in Streamlit secrets."""
-    try:
-        expected = st.secrets.get("app_password", "")
-    except Exception:
-        expected = ""
-
-    # If no password is configured, skip the gate
-    if not expected:
-        return True
-
-    if "authenticated" not in st.session_state:
-        st.session_state["authenticated"] = False
-
-    if st.session_state["authenticated"]:
-        return True
-
-    # Show login screen
-    st.markdown("""
-    <div style="display:flex;flex-direction:column;align-items:center;justify-content:center;
-                min-height:50vh;text-align:center;">
-        <h1 style="font-size:2rem;margin-bottom:0.3rem;">🔍 RampID Detector</h1>
-        <p style="color:#888;margin-bottom:1.5rem;">Enter your password to access the tool</p>
-    </div>
-    """, unsafe_allow_html=True)
-
-    col1, col2, col3 = st.columns([1, 1.5, 1])
-    with col2:
-        pwd = st.text_input("Password", type="password", label_visibility="collapsed",
-                            placeholder="Enter password...", key="pwd_input")
-        if st.button("Unlock", type="primary", use_container_width=True):
-            if pwd == expected:
-                st.session_state["authenticated"] = True
-                st.rerun()
-            else:
-                st.error("Incorrect password.")
-
-    return False
-
-
-if not check_password():
-    st.stop()
-
-
-# ---------------------------------------------------------------------------
 # Custom CSS
 # ---------------------------------------------------------------------------
 
