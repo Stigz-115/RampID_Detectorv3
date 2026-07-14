@@ -170,8 +170,16 @@ async def _scan_with_playwright(url: str, timeout_ms: int = 30000) -> ScanResult
 
 
 def scan_with_playwright(url: str, timeout_ms: int = 30000) -> ScanResult:
-    """Synchronous wrapper for the Playwright scanner."""
-    return asyncio.run(_scan_with_playwright(url, timeout_ms))
+    """Synchronous wrapper for the Playwright scanner.
+    Falls back to requests mode if Playwright browser is not installed."""
+    result = asyncio.run(_scan_with_playwright(url, timeout_ms))
+    if result.error and "Executable doesn't exist" in result.error:
+        # Playwright browser not installed — fall back to requests mode
+        fallback = scan_with_requests(url, timeout=timeout_ms // 1000)
+        fallback.scan_mode = "requests (fallback from playwright)"
+        fallback.summary = f"Playwright browser not available. Used requests mode instead. {fallback.summary}"
+        return fallback
+    return result
 
 
 # ---------------------------------------------------------------------------
