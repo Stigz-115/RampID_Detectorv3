@@ -44,10 +44,65 @@ RAMPID_KEYWORDS = [
     "idsync",
     "id_sync",
     "ats.js",              # LiveRamp's Authenticated Traffic Solution script
+    "ats.min.js",
     "enabler.js",          # Legacy LiveRamp enabler
     "pippio",
     "rlcdn",
 ]
+
+# LiveRamp ATS (Authenticated Traffic Solution) configuration signals.
+# ATS captures authenticated user identifiers (email, user ID) from login
+# forms and converts them to RampIDs. Detecting these on a healthcare site
+# is critical: email → RampID → condition query = PHI disclosure chain.
+ATS_SIGNALS = [
+    "ats.js", "ats.min.js", "liveramp_ats", "atsconfig",
+    "placement_id", "codeType", "envelope",
+    "identifierCollection", "liveRampATS",
+    "ats.setconfig", "ats.start",
+]
+
+# LiveRamp identity cookie names that indicate RampID / identity resolution
+LIVERAMP_COOKIES = [
+    "_lr_env", "_lr_uuid", "rlas_id", "lr_uid", "_lr_retry_token",
+    "lr_flash_cookie", "_lr_env_v3", "ani", "_ats",
+]
+
+# ---------------------------------------------------------------------------
+# PII / PHI page detection signals
+# Used to classify whether a page handles protected health information,
+# which elevates the severity of any LiveRamp detection on that page.
+# ---------------------------------------------------------------------------
+
+AUTH_SIGNALS = {
+    "text": [r"\bsign[\s-]?in\b", r"\bsign[\s-]?up\b", r"\blog[\s-]?in\b",
+             r"\bcreate (an )?account\b", r"\bregister\b", r"\bforgot password\b"],
+    "url": [r"/login", r"/signin", r"/signup", r"/register", r"/account", r"/auth"],
+    "input": [(r"type=[\"']?password", "password field"),
+              (r"name=[\"']?(email|username|user[_-]?id|login)", "email / username field")],
+}
+
+CONDITION_SIGNALS = {
+    "text": [r"\bfind a (doctor|provider|physician|specialist)\b",
+             r"\bdoctor (lookup|search|finder)\b",
+             r"\bfilter by (condition|specialty|symptom)\b",
+             r"\bsearch by condition\b", r"\bprovider directory\b"],
+    "url": [r"/find[-_]?a[-_]?doctor", r"/doctor", r"/provider", r"/physician",
+            r"/find[-_]?care", r"/specialt", r"/directory"],
+    "field": [(r"(name|id)=[\"']?(condition|specialty|speciality|symptom|ailment|diagnosis)",
+               "condition / specialty selector")],
+}
+CONDITION_KEYWORDS = ["cardiology", "oncology", "psychiatry", "hiv", "diabetes",
+                      "mental health", "obgyn", "fertility", "addiction", "condition",
+                      "specialty", "symptom"]
+
+BOOKING_SIGNALS = {
+    "text": [r"\bbook (an )?appointment\b", r"\bschedule (an )?appointment\b",
+             r"\brequest (an )?appointment\b", r"\bbook now\b", r"\bmake an appointment\b",
+             r"\bschedule a visit\b", r"\breserve a\b"],
+    "url": [r"/appointment", r"/book", r"/schedule", r"/booking", r"/request[-_]?visit"],
+    "field": [(r"(name|id)=[\"']?(appointment|preferred[_-]?date|visit[_-]?date|time[_-]?slot)",
+               "appointment date/time field")],
+}
 
 
 # ---------------------------------------------------------------------------
@@ -109,6 +164,12 @@ class ScanResult:
     # Metadata
     page_title: str = ""
     error: Optional[str] = None
+
+    # HIPAA audit data (collected during scan, used by hipaa_engine)
+    pii_categories: list = field(default_factory=list)       # ["auth", "condition", "booking"]
+    pii_evidence: dict = field(default_factory=dict)
+    ats_signals: list = field(default_factory=list)          # ATS config signals detected
+    liveramp_cookies: list = field(default_factory=list)     # LiveRamp identity cookies
 
     @property
     def has_rampid(self) -> bool:
@@ -251,3 +312,101 @@ def find_script_references(html: str) -> list[str]:
                 refs.append("inline script referencing LiveRamp/RampID")
 
     return list(dict.fromkeys(refs))  # dedupe preserving order
+
+
+# ---------------------------------------------------------------------------
+# PII / PHI page classification
+# ---------------------------------------------------------------------------
+
+def classify_page(url: str, html: str) -> dict:
+    """
+    Classify a page against three PII/PHI use cases relevant to HIPAA:
+
+    1. auth      - account signup / login (email or user ID entry)
+    2. condition - doctor/provider lookup filterable by medical condition
+    3. booking   - appointment booking
+
+    Returns a dict with matched categories and evidence.
+    """
+    low = html.lower()
+    url_lower = url.lower()
+    categories = []
+    evidence = {}
+
+    for name, sig in [("auth", AUTH_SIGNALS), ("condition", CONDITION_SIGNALS), ("booking", BOOKING_SIGNALS)]:
+        hits = []
+        for pat in sig.get("url", []):
+            if re.search(pat, url_lower):
+                hits.append(f"URL path suggests {name}: {pat}")
+        for pat in sig.get("text", []):
+            m = re.search(pat, low)
+            if m:
+                hits.append(f'page text: "{m.group(0).strip()}"')
+        for pat, label in sig.get("input", []) + sig.get("field", []):
+            if re.search(pat, low):
+                hits.append(f"form contains {label}")
+        if name == "condition":
+            found = [k for k in CONDITION_KEYWORDS if k in low]
+            if len(found) >= 2:
+                hits.append("condition keywords: " + ", ".join(found[:5]))
+        if hits:
+            categories.append(name)
+            evidence[name] = hits
+
+    return {"categories": categories, "evidence": evidence}
+
+
+def detect_ats_config(html: str) -> list[str]:
+    """
+    Detect LiveRamp ATS configuration signals in page source.
+
+    ATS captures authenticated user identifiers (email, user ID) and
+    converts them to RampIDs. Returns a list of detected signals.
+    """
+    low = html.lower()
+    found = []
+    for signal in ATS_SIGNALS:
+        if signal.lower() in low:
+            found.append(signal)
+    return found
+
+
+def find_liveramp_cookies(cookies) -> list[dict]:
+    """
+    Detect LiveRamp identity cookies from a cookie jar or cookie list.
+
+    Args:
+        cookies: A requests Response.cookies jar, a list of cookie dicts,
+                 or a Playwright cookie list.
+
+    Returns:
+        List of dicts with cookie name, domain, and whether it matched
+        a known LiveRamp cookie name or domain.
+    """
+    matches = []
+    seen_names = set()
+
+    for cookie in cookies:
+        name = getattr(cookie, "name", "") or (cookie.get("name", "") if isinstance(cookie, dict) else "")
+        domain = getattr(cookie, "domain", "") or (cookie.get("domain", "") if isinstance(cookie, dict) else "")
+        value = getattr(cookie, "value", "") or (cookie.get("value", "") if isinstance(cookie, dict) else "")
+
+        name_lower = name.lower()
+        domain_lower = (domain or "").lower()
+
+        is_lr_name = any(name_lower == lr.lower() or name_lower.startswith(lr.lower())
+                         for lr in LIVERAMP_COOKIES)
+        is_lr_domain = "liveramp" in domain_lower or "rlcdn" in domain_lower
+
+        if is_lr_name or is_lr_domain:
+            key = (name, domain)
+            if key not in seen_names:
+                seen_names.add(key)
+                matches.append({
+                    "name": name,
+                    "domain": domain or "",
+                    "value_preview": (value[:80] + "...") if len(value) > 80 else value,
+                    "matched_by": "name" if is_lr_name else "domain",
+                })
+
+    return matches

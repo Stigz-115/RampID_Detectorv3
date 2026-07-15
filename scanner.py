@@ -19,10 +19,15 @@ from patterns import (
     RampIDMatch,
     find_rampids,
     find_script_references,
+    find_liveramp_cookies,
+    detect_ats_config,
+    classify_page,
     is_rlcdn_url,
     is_liveramp_url,
     LIVERAMP_DOMAINS,
     RAMPID_KEYWORDS,
+    LIVERAMP_COOKIES,
+    ATS_SIGNALS,
 )
 
 
@@ -161,6 +166,18 @@ async def _scan_with_playwright(url: str, timeout_ms: int = 30000) -> ScanResult
                     if not any(existing.value == m.value for existing in result.rampid_matches):
                         result.rampid_matches.append(m)
 
+            # --- HIPAA audit: PII page classification ---
+            page_info = classify_page(url, page_content)
+            result.pii_categories = page_info["categories"]
+            result.pii_evidence = page_info["evidence"]
+
+            # --- HIPAA audit: ATS configuration detection ---
+            result.ats_signals = detect_ats_config(page_content)
+
+            # --- HIPAA audit: LiveRamp identity cookies ---
+            all_cookies = await context.cookies()
+            result.liveramp_cookies = find_liveramp_cookies(all_cookies)
+
             await browser.close()
 
     except Exception as e:
@@ -280,6 +297,17 @@ def scan_with_requests(url: str, timeout: int = 15) -> ScanResult:
                 result.rlcdn_requests.append({"url": href, "method": "GET", "resource_type": "link"})
             elif is_liveramp_url(href):
                 result.liveramp_requests.append({"url": href, "method": "GET", "resource_type": "link"})
+
+        # --- HIPAA audit: PII page classification ---
+        page_info = classify_page(url, html)
+        result.pii_categories = page_info["categories"]
+        result.pii_evidence = page_info["evidence"]
+
+        # --- HIPAA audit: ATS configuration detection ---
+        result.ats_signals = detect_ats_config(html)
+
+        # --- HIPAA audit: LiveRamp identity cookies ---
+        result.liveramp_cookies = find_liveramp_cookies(response.cookies)
 
     except req.exceptions.Timeout:
         result.error = "Request timed out"

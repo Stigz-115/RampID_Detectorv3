@@ -18,12 +18,19 @@ Features:
 
 import streamlit as st
 import re
+import json
 
 from patterns import ScanResult, RampIDMatch, LIVERAMP_DOMAINS, RAMPID_KEYWORDS
 from scanner import scan_website, normalize_url
 from researcher import (
     ResearchReport, SearchResult,
     search_duckduckgo, search_google,
+)
+from auditor import run_hipaa_audit
+from hipaa_engine import (
+    HIPAA_CATEGORY_LABELS,
+    SEVERITY_COLORS,
+    report_to_dict,
 )
 
 
@@ -85,6 +92,23 @@ st.markdown("""
     }
     .signal-found { background: #1a3a1a; color: #4caf50; }
     .signal-none { background: #3a1a1a; color: #f44336; }
+    .sev-badge {
+        display: inline-block; padding: 3px 10px; border-radius: 3px;
+        font-size: 11px; font-weight: 600; letter-spacing: .08em;
+        text-transform: uppercase; color: #fff;
+    }
+    .hipaa-tag {
+        display: inline-block; padding: 2px 8px; border-radius: 3px;
+        font-size: 10px; margin: 2px 4px 2px 0; color: #fff;
+    }
+    .score-gauge {
+        width: 160px; height: 160px; border-radius: 50%;
+        display: flex; align-items: center; justify-content: center;
+        flex-direction: column; margin: 0 auto;
+    }
+    .score-num { font-size: 42px; font-weight: 700; color: #fff; }
+    .score-lbl { font-size: 11px; color: #fff; text-transform: uppercase;
+        letter-spacing: .1em; opacity: .85; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -334,7 +358,12 @@ def _display_research_report(report: ResearchReport):
 st.markdown('<div class="main-header">🔍 RampID Detector</div>', unsafe_allow_html=True)
 st.markdown('<div class="sub-header">Detect LiveRamp / RampID usage on prospect websites</div>', unsafe_allow_html=True)
 
-tab_scan, tab_research, tab_combined = st.tabs(["🌐 Website Scanner", "🔎 Web Research", "🚀 Combined Scan"])
+tab_scan, tab_research, tab_combined, tab_hipaa = st.tabs([
+    "🌐 Website Scanner",
+    "🔎 Web Research",
+    "🚀 Combined Scan",
+    "🛡️ HIPAA Audit",
+])
 
 
 # ---------------------------------------------------------------------------
@@ -481,3 +510,163 @@ with tab_combined:
                     st.info("💡 **Public evidence found** – Partnership mentions exist but no live RampID detected. Implementation may be partial, retired, or behind consent layers.")
                 else:
                     st.warning("📭 **No signals found** – No RampID detected on website or in public sources. Prospect likely not using LiveRamp.")
+
+
+# ---------------------------------------------------------------------------
+# Tab 4: HIPAA Audit
+# ---------------------------------------------------------------------------
+
+with tab_hipaa:
+    st.markdown("""
+    Run a HIPAA compliance audit on a website for LiveRamp / RampID usage.
+    Detects whether RampID identity resolution is active on pages handling
+    PHI (login, condition lookup, appointment booking) and maps findings
+    to HIPAA Safeguard categories with severity ratings.
+    """)
+
+    col1, col2 = st.columns([3, 1])
+    with col1:
+        hipaa_url = st.text_input(
+            "Website URL to audit",
+            placeholder="e.g., https://www.example-health.org",
+            key="hipaa_url_input",
+        )
+    with col2:
+        st.markdown("&nbsp;")
+        hipaa_btn = st.button("🛡️ Run HIPAA Audit", type="primary", use_container_width=True, key="hipaa_btn")
+
+    if hipaa_btn:
+        if not hipaa_url.strip():
+            st.warning("Please enter a website URL.")
+        else:
+            url = normalize_url(hipaa_url)
+            st.info(f"Running HIPAA audit on **{url}** using **{scan_mode}** mode...")
+
+            with st.spinner("Scanning for LiveRamp / RampID + HIPAA signals..."):
+                scan_result = scan_website(url, mode=scan_mode, timeout_ms=scan_timeout * 1000)
+
+            if scan_result.error:
+                st.error(f"Scan error: {scan_result.error}")
+            else:
+                audit_report = run_hipaa_audit(scan_result)
+
+                # --- Compliance score gauge ---
+                score = audit_report.compliance_score
+                if score >= 75:
+                    gauge_color = "#1f7a5c"; gauge_label = "Compliant"
+                elif score >= 50:
+                    gauge_color = "#b07908"; gauge_label = "Needs Work"
+                else:
+                    gauge_color = "#b02525"; gauge_label = "At Risk"
+
+                col_score, col_stats = st.columns([1, 3])
+
+                with col_score:
+                    st.markdown(
+                        f"""
+                        <div class="score-gauge" style="background:{gauge_color}">
+                          <div class="score-num">{score}</div>
+                          <div class="score-lbl">{gauge_label}</div>
+                        </div>
+                        """,
+                        unsafe_allow_html=True,
+                    )
+                    st.markdown(
+                        f'<p style="text-align:center;color:#888;font-size:11px;margin-top:6px">'
+                        f'Compliance Score (0-100)</p>',
+                        unsafe_allow_html=True,
+                    )
+
+                with col_stats:
+                    summary = audit_report.summary
+                    sev = summary.get("by_severity", {})
+                    cats = summary.get("by_category", {})
+
+                    s1, s2, s3, s4, s5 = st.columns(5)
+                    with s1:
+                        st.metric("Total findings", summary.get("total", 0))
+                    with s2:
+                        st.metric("Critical", sev.get("critical", 0))
+                    with s3:
+                        st.metric("High", sev.get("high", 0))
+                    with s4:
+                        st.metric("Medium", sev.get("medium", 0))
+                    with s5:
+                        st.metric("Low", sev.get("low", 0))
+
+                    st.markdown("")
+                    cat_cols = st.columns(3)
+                    for i, (cat, label) in enumerate(HIPAA_CATEGORY_LABELS.items()):
+                        with cat_cols[i]:
+                            st.metric(label.split("(")[0].strip(), cats.get(cat, 0))
+
+                st.markdown("---")
+
+                # --- PII page context ---
+                if scan_result.pii_categories:
+                    st.markdown("### 🏥 PII / PHI Page Detection")
+                    pii_labels = {
+                        "auth": "Account signup / login",
+                        "condition": "Condition-filtered doctor lookup",
+                        "booking": "Appointment booking",
+                    }
+                    for cat in scan_result.pii_categories:
+                        st.markdown(f"• **{pii_labels.get(cat, cat)}**")
+                    if scan_result.ats_signals:
+                        st.markdown(f"• **LiveRamp ATS detected:** {', '.join(scan_result.ats_signals)}")
+                    if scan_result.liveramp_cookies:
+                        st.markdown(f"• **LiveRamp identity cookies:** {', '.join(c['name'] for c in scan_result.liveramp_cookies)}")
+
+                # --- Findings ---
+                st.markdown("### 📋 HIPAA Findings")
+
+                if not audit_report.findings:
+                    st.success("No HIPAA compliance findings detected. 🎉")
+                else:
+                    cat_colors = {
+                        "administrative": "#0d5c63",
+                        "physical": "#6c3a7e",
+                        "technical": "#1c4e80",
+                    }
+
+                    for f in audit_report.findings:
+                        color = SEVERITY_COLORS.get(f.severity, "#888")
+                        st.markdown(
+                            f"""
+                            <div style="border-left:4px solid {color};padding:10px 16px;
+                                margin-bottom:12px;background:#1a1a2e;border-radius:0 4px 4px 0;">
+                              <div style="display:flex;justify-content:space-between;align-items:center;">
+                                <span style="font-weight:600;font-size:15px;">{f.title}</span>
+                                <span class="sev-badge" style="background:{color}">{f.severity}</span>
+                              </div>
+                              <div style="margin-top:6px;">
+                                <span class="hipaa-tag" style="background:{cat_colors.get(f.hipaa_category, '#888')}">
+                                  {HIPAA_CATEGORY_LABELS[f.hipaa_category]}
+                                </span>
+                                <span class="hipaa-tag" style="background:#5d6b6b">{f.citation}</span>
+                              </div>
+                              <p style="margin-top:8px;color:#aaa;font-size:14px;">{f.description}</p>
+                            </div>
+                            """,
+                            unsafe_allow_html=True,
+                        )
+                        with st.expander("Evidence & Recommendation", expanded=False):
+                            st.markdown(f"**Evidence:** {f.evidence}")
+                            st.markdown(f"**Recommendation:** {f.recommendation}")
+
+                # --- Export ---
+                st.markdown("---")
+                st.markdown("### 📥 Export")
+                report_dict = report_to_dict(audit_report)
+                st.download_button(
+                    label="Download JSON Report",
+                    data=json.dumps(report_dict, indent=2),
+                    file_name=f"hipaa_audit_{url.replace('https://', '').replace('http://', '').split('/')[0]}.json",
+                    mime="application/json",
+                )
+
+                st.caption(
+                    "⚠️ This tool provides automated heuristic analysis only. Findings should be "
+                    "verified manually and do not constitute legal advice or a complete HIPAA "
+                    "compliance assessment."
+                )
