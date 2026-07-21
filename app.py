@@ -19,12 +19,13 @@ Features:
 import streamlit as st
 import re
 
-from patterns import ScanResult, RampIDMatch, LIVERAMP_DOMAINS, RAMPID_KEYWORDS
-from scanner import scan_website, normalize_url
+from patterns import ScanResult, CrawlResult, RampIDMatch, LIVERAMP_DOMAINS, RAMPID_KEYWORDS
+from scanner import scan_website, crawl_website, normalize_url
 from researcher import (
     ResearchReport, SearchResult,
     search_duckduckgo, search_google,
 )
+from bulk import parse_bulk_input, run_bulk_scan, results_to_dataframe
 
 
 # ---------------------------------------------------------------------------
@@ -108,6 +109,26 @@ scan_timeout = st.sidebar.slider(
     "Scan Timeout (seconds)",
     min_value=10, max_value=60, value=30, step=5,
 )
+dismiss_consent = st.sidebar.checkbox(
+    "Try to dismiss cookie banners",
+    value=True,
+    help="Playwright mode only. Best-effort click of common 'Accept all' cookie-consent "
+         "buttons before capturing signals, since many sites gate tracking scripts "
+         "(including LiveRamp's) behind a consent banner.",
+)
+crawl_enabled = st.sidebar.checkbox(
+    "Crawl additional pages",
+    value=True,
+    help="RampID often only fires on specific pages (login, checkout, privacy policy) "
+         "rather than the homepage. When on, the scanner discovers same-domain links "
+         "and scans a few more pages beyond the one you entered.",
+)
+max_pages = st.sidebar.slider(
+    "Max pages to crawl",
+    min_value=1, max_value=10, value=5, step=1,
+    disabled=not crawl_enabled,
+    help="Total pages scanned per site, including the entry URL.",
+) if crawl_enabled else 1
 
 # Research settings
 st.sidebar.markdown("### Web Research")
@@ -265,6 +286,23 @@ def _display_scan_result(result: ScanResult):
                 "behind a consent layer that blocks tracking scripts without user interaction.")
 
 
+def _display_crawl_result(crawl: CrawlResult):
+    """Render a CrawlResult: aggregated verdict across all pages, then a per-page breakdown."""
+    if crawl.error:
+        st.error(f"Scan error: {crawl.error}")
+        return
+
+    # Aggregated view reuses the single-page renderer over the merged signals.
+    _display_scan_result(crawl.merged_result())
+
+    if len(crawl.pages) > 1:
+        st.markdown("---")
+        with st.expander(f"📄 Per-Page Breakdown ({len(crawl.pages)} pages scanned)", expanded=False):
+            for i, page in enumerate(crawl.pages, 1):
+                badge = "✅" if page.has_rampid else "⬜"
+                st.markdown(f"**{i}. {badge} {page.url}** — {page.summary}")
+
+
 def _display_search_result(index: int, result: SearchResult):
     """Render a single SearchResult."""
     score_pct = int(result.relevance_score * 100)
@@ -334,7 +372,9 @@ def _display_research_report(report: ResearchReport):
 st.markdown('<div class="main-header">🔍 RampID Detector</div>', unsafe_allow_html=True)
 st.markdown('<div class="sub-header">Detect LiveRamp / RampID usage on prospect websites</div>', unsafe_allow_html=True)
 
-tab_scan, tab_research, tab_combined = st.tabs(["🌐 Website Scanner", "🔎 Web Research", "🚀 Combined Scan"])
+tab_scan, tab_research, tab_combined, tab_bulk = st.tabs(
+    ["🌐 Website Scanner", "🔎 Web Research", "🚀 Combined Scan", "📋 Bulk Scan"]
+)
 
 
 # ---------------------------------------------------------------------------
@@ -358,12 +398,16 @@ with tab_scan:
             st.warning("Please enter a website URL.")
         else:
             url = normalize_url(scan_url)
-            st.info(f"Scanning **{url}** using **{scan_mode}** mode...")
+            crawl_note = f" (crawling up to {max_pages} pages)" if crawl_enabled and max_pages > 1 else ""
+            st.info(f"Scanning **{url}** using **{scan_mode}** mode{crawl_note}...")
 
             with st.spinner("Scanning website for RampID / LiveRamp signals..."):
-                result = scan_website(url, mode=scan_mode, timeout_ms=scan_timeout * 1000)
+                result = crawl_website(
+                    url, mode=scan_mode, max_pages=max_pages,
+                    timeout_ms=scan_timeout * 1000, dismiss_consent=dismiss_consent,
+                )
 
-            _display_scan_result(result)
+            _display_crawl_result(result)
 
 
 # ---------------------------------------------------------------------------
@@ -428,8 +472,11 @@ with tab_combined:
                 st.markdown("### 🌐 Website Scan")
                 with st.spinner("Scanning website..."):
                     url = normalize_url(combined_url)
-                    scan_result = scan_website(url, mode=scan_mode, timeout_ms=scan_timeout * 1000)
-                    _display_scan_result(scan_result)
+                    scan_result = crawl_website(
+                        url, mode=scan_mode, max_pages=max_pages,
+                        timeout_ms=scan_timeout * 1000, dismiss_consent=dismiss_consent,
+                    )
+                    _display_crawl_result(scan_result)
                     results_collected["scan"] = scan_result
 
             # --- Web research ---
@@ -481,3 +528,99 @@ with tab_combined:
                     st.info("💡 **Public evidence found** – Partnership mentions exist but no live RampID detected. Implementation may be partial, retired, or behind consent layers.")
                 else:
                     st.warning("📭 **No signals found** – No RampID detected on website or in public sources. Prospect likely not using LiveRamp.")
+
+
+# ---------------------------------------------------------------------------
+# Tab 4: Bulk Scan
+# ---------------------------------------------------------------------------
+
+with tab_bulk:
+    st.markdown("""
+    Scan many websites at once for a prospect list. Paste one URL per line and/or
+    upload a CSV with a URL column. Duplicate URLs are merged automatically.
+    """)
+
+    col1, col2 = st.columns([2, 1])
+    with col1:
+        bulk_text = st.text_area(
+            "URLs (one per line)",
+            placeholder="example.com\nanother-site.com\nhttps://prospect.io",
+            height=150,
+            key="bulk_url_text",
+        )
+    with col2:
+        bulk_csv = st.file_uploader("Or upload a CSV", type=["csv"], key="bulk_csv_upload")
+        st.caption(
+            "Looks for a column named url/website/domain/site/company_url/link; "
+            "falls back to the first column."
+        )
+
+    bulk_is_playwright = scan_mode == "playwright"
+    if bulk_is_playwright:
+        st.warning(
+            "⚠️ Playwright mode launches a full headless browser per site. On "
+            "Streamlit Community Cloud's free tier, running many concurrently can "
+            "exhaust memory/CPU — concurrency is capped low and large batches may be slow. "
+            "Requests mode is recommended for bulk scans."
+        )
+    bulk_concurrency = st.slider(
+        "Concurrent scans",
+        min_value=1,
+        max_value=3 if bulk_is_playwright else 10,
+        value=2 if bulk_is_playwright else 5,
+        help="Requests mode is I/O-bound and safe to parallelize. Playwright concurrency "
+             "is capped at 3 regardless of this value to protect limited hosting resources.",
+    )
+
+    bulk_btn = st.button("📋 Run Bulk Scan", type="primary", use_container_width=True)
+
+    if bulk_btn:
+        urls = parse_bulk_input(bulk_text, bulk_csv)
+        if not urls:
+            st.warning("Please paste at least one URL or upload a CSV with a URL column.")
+        else:
+            crawl_note = f" (crawling up to {max_pages} pages each)" if crawl_enabled and max_pages > 1 else ""
+            st.info(f"Scanning **{len(urls)}** URL(s) using **{scan_mode}** mode{crawl_note}...")
+
+            progress_bar = st.progress(0.0)
+            status_text = st.empty()
+
+            def _on_bulk_progress(done, total):
+                progress_bar.progress(done / total)
+                status_text.text(f"Scanned {done}/{total}")
+
+            bulk_results = run_bulk_scan(
+                urls,
+                mode=scan_mode,
+                max_pages=max_pages,
+                timeout_ms=scan_timeout * 1000,
+                dismiss_consent=dismiss_consent,
+                max_concurrency=bulk_concurrency,
+                progress_callback=_on_bulk_progress,
+            )
+
+            status_text.text(f"Done — scanned {len(urls)}/{len(urls)}")
+            st.session_state["bulk_results"] = bulk_results
+
+    if "bulk_results" in st.session_state:
+        bulk_results = st.session_state["bulk_results"]
+        st.markdown("---")
+        st.markdown(f"### 📊 Results ({len(bulk_results)} site(s))")
+
+        results_df = results_to_dataframe(bulk_results)
+        st.dataframe(results_df, use_container_width=True, hide_index=True)
+
+        csv_bytes = results_df.to_csv(index=False).encode("utf-8")
+        st.download_button(
+            "⬇️ Download CSV",
+            data=csv_bytes,
+            file_name="rampid_bulk_scan_results.csv",
+            mime="text/csv",
+        )
+
+        st.markdown("#### 🔍 Drill Into a Site")
+        site_urls = [r.url for r in bulk_results]
+        selected_url = st.selectbox("Select a site to see its full breakdown", options=site_urls, key="bulk_drill_select")
+        selected_result = next((r for r in bulk_results if r.url == selected_url), None)
+        if selected_result:
+            _display_crawl_result(selected_result)

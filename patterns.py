@@ -49,6 +49,13 @@ RAMPID_KEYWORDS = [
     "rlcdn",
 ]
 
+# URL path keywords that make a discovered link worth crawling first — RampID
+# often only fires on pages like these rather than the homepage.
+PAGE_PRIORITY_KEYWORDS = [
+    "privacy", "cookie", "consent", "login", "signin", "sign-in",
+    "account", "checkout", "cart", "subscribe", "register", "signup", "sign-up",
+]
+
 
 # ---------------------------------------------------------------------------
 # RampID identifier regex
@@ -60,21 +67,28 @@ RAMPID_KEYWORDS = [
 
 _HASH_CHARS = r"[A-Za-z0-9_\-]"
 
+# The hash charset includes '-'/'_', which are non-word characters, so a
+# plain \b boundary can fail to match right after them (e.g. a RampID ending
+# in '-' immediately followed by a quote). Use explicit lookarounds tied to
+# the actual charset instead of \b so boundaries are correctness-based.
+_LEFT_BOUND = r"(?<![A-Za-z0-9_\-])"
+_RIGHT_BOUND = r"(?![A-Za-z0-9_\-])"
+
 # XY<4 digits><43 hash chars> = 2 + 4 + 43 = 49
-_RAMPID_49 = re.compile(rf"\b(XY|Xi)\d{{4}}{_HASH_CHARS}{{43}}\b")
+_RAMPID_49 = re.compile(rf"{_LEFT_BOUND}(XY|Xi)\d{{4}}{_HASH_CHARS}{{43}}{_RIGHT_BOUND}")
 
 # XY<4 digits><64 hash chars> = 2 + 4 + 64 = 70
-_RAMPID_70 = re.compile(rf"\b(XY|Xi)\d{{4}}{_HASH_CHARS}{{64}}\b")
+_RAMPID_70 = re.compile(rf"{_LEFT_BOUND}(XY|Xi)\d{{4}}{_HASH_CHARS}{{64}}{_RIGHT_BOUND}")
 
 # Combined pattern for any valid RampID
 RAMPID_PATTERN = re.compile(
-    rf"\b(XY|Xi)\d{{4}}{_HASH_CHARS}{{43}}\b"   # 49-char variant
+    rf"{_LEFT_BOUND}(XY|Xi)\d{{4}}{_HASH_CHARS}{{43}}{_RIGHT_BOUND}"   # 49-char variant
     rf"|"
-    rf"\b(XY|Xi)\d{{4}}{_HASH_CHARS}{{64}}\b",   # 70-char variant
+    rf"{_LEFT_BOUND}(XY|Xi)\d{{4}}{_HASH_CHARS}{{64}}{_RIGHT_BOUND}",   # 70-char variant
 )
 
 # Broader fallback: XY/Xi + 4 digits + at least 20 hash chars (catches truncated IDs)
-RAMPID_BROAD = re.compile(rf"\b(XY|Xi)\d{{4}}{_HASH_CHARS}{{20,}}\b")
+RAMPID_BROAD = re.compile(rf"{_LEFT_BOUND}(XY|Xi)\d{{4}}{_HASH_CHARS}{{20,}}{_RIGHT_BOUND}")
 
 
 # ---------------------------------------------------------------------------
@@ -116,19 +130,38 @@ class ScanResult:
         return bool(self.rlcdn_requests or self.rampid_matches or self.script_references)
 
     @property
+    def _has_exact_rampid(self) -> bool:
+        """True if any RampID match is a full-length (49/70-char) identifier,
+        as opposed to a "broad"/truncated fallback match."""
+        return any(m.variant in ("49-char", "70-char") for m in self.rampid_matches)
+
+    @property
+    def _has_cookie_name_only_match(self) -> bool:
+        """True if cookie_matches contains only weak name-keyword hits (no
+        RampID values actually found in any cookie)."""
+        return bool(self.cookie_matches) and not any(c.get("rampids_found") for c in self.cookie_matches)
+
+    @property
     def confidence(self) -> str:
-        """Confidence level of the detection."""
-        signals = sum([
-            bool(self.rlcdn_requests),
-            bool(self.rampid_matches),
+        """Confidence level of the detection.
+
+        rlcdn.com calls and exact RampID matches are direct technical proof
+        and reach High on their own. Script references / broad RampID matches
+        are corroborating-but-not-definitive (Medium). A bare cookie-name
+        keyword match with no actual RampID value found is the weakest signal
+        (Low) since it can false-positive on unrelated cookies.
+        """
+        if self.rlcdn_requests or self._has_exact_rampid:
+            return "High"
+
+        weak_signal_count = sum([
             bool(self.script_references),
+            bool(self.rampid_matches),   # broad-only matches at this point
             bool(self.cookie_matches),
         ])
-        if signals >= 3:
-            return "High"
-        elif signals >= 2:
+        if self.script_references or (self.rampid_matches and not self._has_exact_rampid) or weak_signal_count >= 2:
             return "Medium"
-        elif signals >= 1:
+        if self._has_cookie_name_only_match:
             return "Low"
         return "None"
 
@@ -149,6 +182,69 @@ class ScanResult:
         if self.cookie_matches:
             parts.append(f"{len(self.cookie_matches)} cookie match(es)")
         return "Detected: " + ", ".join(parts) + f" (Confidence: {self.confidence})"
+
+
+@dataclass
+class CrawlResult:
+    """Aggregated results from scanning a URL plus a handful of its same-domain pages."""
+    url: str = ""                                       # entry URL
+    scan_mode: str = ""
+    pages: list[ScanResult] = field(default_factory=list)   # one ScanResult per page scanned
+    error: Optional[str] = None
+
+    def merged_result(self) -> ScanResult:
+        """Build a synthetic ScanResult with the union of all per-page signals,
+        deduped by value, so existing confidence/summary logic (and display code)
+        can be reused as-is."""
+        merged = ScanResult(url=self.url, scan_mode=self.scan_mode)
+        seen_rlcdn, seen_liveramp, seen_rampid, seen_script, seen_cookie = set(), set(), set(), set(), set()
+
+        for page in self.pages:
+            for req in page.rlcdn_requests:
+                if req["url"] not in seen_rlcdn:
+                    seen_rlcdn.add(req["url"])
+                    merged.rlcdn_requests.append(req)
+            for req in page.liveramp_requests:
+                if req["url"] not in seen_liveramp:
+                    seen_liveramp.add(req["url"])
+                    merged.liveramp_requests.append(req)
+            for m in page.rampid_matches:
+                if m.value not in seen_rampid:
+                    seen_rampid.add(m.value)
+                    merged.rampid_matches.append(m)
+            for ref in page.script_references:
+                if ref not in seen_script:
+                    seen_script.add(ref)
+                    merged.script_references.append(ref)
+            for cookie in page.cookie_matches:
+                key = (cookie.get("name"), cookie.get("domain"))
+                if key not in seen_cookie:
+                    seen_cookie.add(key)
+                    merged.cookie_matches.append(cookie)
+
+        return merged
+
+    @property
+    def has_rampid(self) -> bool:
+        return self.merged_result().has_rampid
+
+    @property
+    def confidence(self) -> str:
+        return self.merged_result().confidence
+
+    @property
+    def pages_with_signal(self) -> list[ScanResult]:
+        """Pages that individually contributed at least one signal."""
+        return [p for p in self.pages if p.has_rampid]
+
+    @property
+    def summary(self) -> str:
+        if self.error:
+            return f"Error: {self.error}"
+        if not self.pages:
+            return "No pages were scanned."
+        base = self.merged_result().summary
+        return f"{base} — across {len(self.pages)} page(s) scanned ({len(self.pages_with_signal)} with signals)"
 
 
 # ---------------------------------------------------------------------------
